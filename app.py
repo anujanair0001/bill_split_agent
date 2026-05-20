@@ -1,5 +1,6 @@
 """Streamlit UI for BillSplit Agent."""
 
+import base64
 from decimal import Decimal
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -45,32 +46,45 @@ def main() -> None:
             bill_text = _receipt_input()
         with agent:
             _agent_briefing(bill_text)
+            _receipt_preview()
 
         if not bill_text.strip():
             return
+        _reset_receipt_flow_if_text_changed(bill_text)
 
         receipt = st.session_state.loaded_receipt or _with_stable_item_ids(parse_bill_text(bill_text, st.session_state.context))
         with work:
-            receipt = _bill_editor(receipt)
             people = _receipt_people_selector()
 
-        if not receipt["items"]:
-            st.warning("No bill items were detected. Check the receipt text or add clearer item lines.")
-            return
         if not people:
             return
 
         with work:
-            assignments = _assignment_editor(receipt, people)
+            receipt = _bill_editor(receipt, people)
             st.session_state.current_receipt = receipt
             st.session_state.current_people = people
-            st.session_state.current_assignments = assignments
+
+        if not receipt["items"]:
+            st.warning("No bill items were detected. Check the receipt text or add clearer item lines.")
+            return
+
+        with work:
+            assignments = st.session_state.current_assignments
             _render_unassigned_people(people, assignments)
+            st.session_state.current_assignments = assignments
             assignment_signature = _assignment_signature(assignments)
             if st.session_state.last_assignment_signature != assignment_signature:
                 st.session_state.last_assignment_signature = assignment_signature
                 st.session_state.plan = None
-            if st.button("Ask agent to split bill", type="primary", use_container_width=True):
+            assignments_complete = _assignments_complete(receipt, assignments)
+            if not st.session_state.receipt_review_complete:
+                st.info("Confirm each item and who ate it before asking the agent to calculate the split.")
+            if st.button(
+                "Ask agent to split bill",
+                type="primary",
+                use_container_width=True,
+                disabled=not st.session_state.receipt_review_complete or not assignments_complete,
+            ):
                 remember_split_preferences(people, st.session_state.context)
                 plan = calculate_bill_split(receipt, people, assignments, st.session_state.context)
                 st.session_state.plan = plan
@@ -86,6 +100,10 @@ def _init_state() -> None:
         st.session_state.context = MockToolContext()
     if "receipt_text" not in st.session_state:
         st.session_state.receipt_text = ""
+    if "receipt_upload" not in st.session_state:
+        st.session_state.receipt_upload = None
+    if "last_receipt_text" not in st.session_state:
+        st.session_state.last_receipt_text = ""
     if "plan" not in st.session_state:
         st.session_state.plan = None
     if "team_members" not in st.session_state:
@@ -98,6 +116,20 @@ def _init_state() -> None:
         st.session_state.current_people = []
     if "current_assignments" not in st.session_state:
         st.session_state.current_assignments = {}
+    if "assignment_item_index" not in st.session_state:
+        st.session_state.assignment_item_index = 0
+    if "receipt_item_index" not in st.session_state:
+        st.session_state.receipt_item_index = 0
+    if "receipt_review_complete" not in st.session_state:
+        st.session_state.receipt_review_complete = False
+    if "manual_item_count" not in st.session_state:
+        st.session_state.manual_item_count = 0
+    if "removed_item_ids" not in st.session_state:
+        st.session_state.removed_item_ids = set()
+    if "confirmed_receipt_items" not in st.session_state:
+        st.session_state.confirmed_receipt_items = {}
+    if "receipt_item_values" not in st.session_state:
+        st.session_state.receipt_item_values = {}
     if "editing_bill_id" not in st.session_state:
         st.session_state.editing_bill_id = None
     if "selected_saved_bill_id" not in st.session_state:
@@ -112,6 +144,34 @@ def _reset_session() -> None:
     for key in list(st.session_state.keys()):
         del st.session_state[key]
     _init_state()
+
+
+def _reset_receipt_flow_if_text_changed(bill_text: str) -> None:
+    if st.session_state.last_receipt_text == bill_text:
+        return
+    st.session_state.last_receipt_text = bill_text
+    st.session_state.loaded_receipt = None
+    st.session_state.current_receipt = None
+    st.session_state.current_assignments = {}
+    st.session_state.assignment_item_index = 0
+    st.session_state.receipt_item_index = 0
+    st.session_state.receipt_review_complete = False
+    st.session_state.manual_item_count = 0
+    st.session_state.removed_item_ids = set()
+    st.session_state.confirmed_receipt_items = {}
+    st.session_state.receipt_item_values = {}
+    st.session_state.plan = None
+    st.session_state.editing_bill_id = None
+    if not st.session_state.get("receipt_upload"):
+        st.session_state.receipt_upload = None
+    _clear_bill_widget_state()
+    st.session_state.assignment_item_index = 0
+    st.session_state.receipt_item_index = 0
+    st.session_state.receipt_review_complete = False
+    st.session_state.manual_item_count = 0
+    st.session_state.removed_item_ids = set()
+    st.session_state.confirmed_receipt_items = {}
+    st.session_state.receipt_item_values = {}
 
 
 def _apply_styles() -> None:
@@ -190,8 +250,14 @@ def _receipt_input() -> str:
         uploaded = st.file_uploader("Receipt image or PDF", type=["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff", "pdf"])
         if uploaded is not None and st.button("Ask agent to read receipt", use_container_width=True):
             suffix = Path(uploaded.name).suffix
+            upload_bytes = uploaded.getvalue()
+            st.session_state.receipt_upload = {
+                "name": uploaded.name,
+                "type": uploaded.type or _mime_type_from_suffix(suffix),
+                "bytes": upload_bytes,
+            }
             with NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
-                temp_file.write(uploaded.getbuffer())
+                temp_file.write(upload_bytes)
                 temp_path = Path(temp_file.name)
             try:
                 with st.spinner("Reading receipt..."):
@@ -212,8 +278,47 @@ def _receipt_input() -> str:
     return st.session_state.receipt_text
 
 
-def _bill_editor(receipt: dict) -> dict:
-    st.subheader("Agent Extracted Bill")
+def _receipt_preview() -> None:
+    upload = st.session_state.get("receipt_upload")
+    if not upload:
+        return
+
+    st.subheader("Receipt Image")
+    file_type = upload.get("type") or ""
+    file_bytes = upload.get("bytes") or b""
+    if file_type.startswith("image/"):
+        st.image(file_bytes, caption=upload.get("name") or "Uploaded receipt", width="stretch")
+        return
+
+    if file_type == "application/pdf":
+        encoded = base64.b64encode(file_bytes).decode("ascii")
+        st.markdown(
+            f'<iframe src="data:application/pdf;base64,{encoded}" width="100%" height="650"></iframe>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    st.caption(upload.get("name") or "Uploaded receipt")
+    st.info("Preview is available for image and PDF uploads.")
+
+
+def _mime_type_from_suffix(suffix: str) -> str:
+    image_types = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".bmp": "image/bmp",
+        ".tif": "image/tiff",
+        ".tiff": "image/tiff",
+    }
+    if suffix.lower() == ".pdf":
+        return "application/pdf"
+    return image_types.get(suffix.lower(), "application/octet-stream")
+
+
+def _bill_editor(receipt: dict, people: list[str]) -> dict:
+    st.subheader("Confirm Receipt Items")
 
     top = st.columns([2, 1, 1, 1, 1])
     with top[0]:
@@ -239,40 +344,10 @@ def _bill_editor(receipt: dict) -> dict:
     receipt_subtotal_value = Decimal(str(receipt_subtotal)).quantize(Decimal("0.01")) if receipt_subtotal else None
     receipt_total_value = Decimal(str(receipt_total)).quantize(Decimal("0.01")) if receipt_total else None
 
-    edited_items = []
-    st.markdown("**Detected items**")
-    for index, item in enumerate(receipt["items"]):
-        cols = st.columns([4, 1])
-        with cols[0]:
-            name = st.text_input("Item", value=item["name"], key=f"item-name-{item['id']}")
-        with cols[1]:
-            price = st.number_input(
-                "Price",
-                min_value=0.0,
-                value=float(item["price"]),
-                step=0.10,
-                format="%.2f",
-                key=f"item-price-{item['id']}",
-            )
-        if name.strip() and price > 0:
-            edited_items.append({"id": item["id"], "name": name.strip(), "price": Decimal(str(price))})
-
-    extra_rows = st.number_input("Add item rows", min_value=0, value=0, step=1)
-    for index in range(extra_rows):
-        cols = st.columns([4, 1])
-        with cols[0]:
-            name = st.text_input("New item", key=f"new-item-name-{index}")
-        with cols[1]:
-            price = st.number_input(
-                "New price",
-                min_value=0.0,
-                value=0.0,
-                step=0.10,
-                format="%.2f",
-                key=f"new-item-price-{index}",
-            )
-        if name.strip() and price > 0:
-            edited_items.append({"id": f"manual-{index}", "name": name.strip(), "price": Decimal(str(price))})
+    review_items = _receipt_review_items(receipt)
+    _sync_assignment_items(review_items)
+    _render_receipt_item_review(review_items, people)
+    edited_items = _edited_receipt_items(review_items)
 
     detected_total = sum((item["price"] for item in edited_items), Decimal("0"))
     detected_total += Decimal(str(service_charge)) + Decimal(str(tax))
@@ -294,7 +369,199 @@ def _bill_editor(receipt: dict) -> dict:
     if st.session_state.get("last_bill_signature") != bill_signature:
         st.session_state.last_bill_signature = bill_signature
         st.session_state.plan = None
+        _prune_removed_item_state({item["id"] for item in edited_items})
     return edited_receipt
+
+
+def _receipt_review_items(receipt: dict) -> list[dict]:
+    removed_item_ids = st.session_state.removed_item_ids
+    items = [item for item in receipt["items"] if item["id"] not in removed_item_ids]
+    for index in range(st.session_state.manual_item_count):
+        item_id = f"manual-{index}"
+        if item_id not in removed_item_ids:
+            items.append({"id": item_id, "name": "", "price": Decimal("0")})
+    if not items:
+        st.session_state.receipt_item_index = 0
+        return items
+    st.session_state.receipt_item_index = min(st.session_state.receipt_item_index, len(items) - 1)
+    return items
+
+
+def _render_receipt_item_review(items: list[dict], people: list[str]) -> None:
+    if not items:
+        st.warning("No items were detected. Add a missing item to continue.")
+        if st.button("Add missing item", type="primary", use_container_width=True):
+            st.session_state.manual_item_count += 1
+            st.session_state.receipt_item_index = 0
+            st.session_state.receipt_review_complete = False
+            st.rerun()
+        return
+
+    current_index = st.session_state.receipt_item_index
+    item = items[current_index]
+    st.markdown(f"**Confirm item {current_index + 1} of {len(items)}**")
+
+    cols = st.columns([4, 1])
+    with cols[0]:
+        st.text_input("Item name", value=_receipt_item_name(item), key=f"item-name-{item['id']}")
+    with cols[1]:
+        st.number_input(
+            "Amount",
+            min_value=0.0,
+            value=float(_receipt_item_price(item)),
+            step=0.10,
+            format="%.2f",
+            key=f"item-price-{item['id']}",
+        )
+    st.markdown("**Who ate this item?**")
+    current_assignment = _assignment_controls(item, people)
+
+    confirmed_count = _confirmed_receipt_item_count(items)
+    st.session_state.receipt_review_complete = confirmed_count == len(items)
+    st.progress(confirmed_count / len(items), text=f"{confirmed_count} of {len(items)} items saved")
+
+    if st.button("Remove this item", use_container_width=True):
+        _remove_receipt_item(item["id"], len(items))
+        st.rerun()
+
+    can_confirm = _receipt_item_is_valid(item) and bool(current_assignment)
+    save_label = "Save receipt" if current_index == len(items) - 1 else "Save and next"
+    if st.button(save_label, type="primary", use_container_width=True, disabled=not can_confirm):
+        _confirm_receipt_item(item, current_assignment)
+        st.session_state.receipt_review_complete = _confirmed_receipt_item_count(items) == len(items)
+        if current_index < len(items) - 1:
+            st.session_state.receipt_item_index = current_index + 1
+        elif not st.session_state.receipt_review_complete:
+            st.session_state.receipt_item_index = _first_unconfirmed_item_index(items)
+        st.rerun()
+
+    nav_cols = st.columns(2)
+    with nav_cols[0]:
+        if st.button("Previous item", use_container_width=True, disabled=current_index == 0):
+            st.session_state.receipt_item_index = max(current_index - 1, 0)
+            st.rerun()
+    with nav_cols[1]:
+        if st.button("Add missing item", use_container_width=True):
+            st.session_state.manual_item_count += 1
+            st.session_state.receipt_item_index = len(items)
+            st.session_state.receipt_review_complete = False
+            st.rerun()
+
+    if not st.session_state.receipt_review_complete:
+        st.info("Edit the item if needed, choose who ate it, then save to move forward.")
+
+
+def _edited_receipt_items(items: list[dict]) -> list[dict]:
+    edited_items = []
+    for item in items:
+        name = _receipt_item_name(item).strip()
+        price = _receipt_item_price(item)
+        if name and price > 0:
+            edited_items.append({"id": item["id"], "name": name, "price": price})
+    return edited_items
+
+
+def _receipt_item_is_valid(item: dict) -> bool:
+    name = _receipt_item_name(item).strip()
+    price = _receipt_item_price(item)
+    return bool(name) and price > 0
+
+
+def _receipt_item_signature(item: dict) -> tuple[str, str]:
+    name = _receipt_item_name(item).strip()
+    price = _receipt_item_price(item).quantize(Decimal("0.01"))
+    return name, str(price)
+
+
+def _receipt_item_name(item: dict) -> str:
+    widget_key = f"item-name-{item['id']}"
+    if widget_key in st.session_state:
+        return str(st.session_state[widget_key])
+    saved = st.session_state.receipt_item_values.get(item["id"], {})
+    return str(saved.get("name", item["name"]))
+
+
+def _receipt_item_price(item: dict) -> Decimal:
+    widget_key = f"item-price-{item['id']}"
+    if widget_key in st.session_state:
+        return Decimal(str(st.session_state[widget_key]))
+    saved = st.session_state.receipt_item_values.get(item["id"], {})
+    return Decimal(str(saved.get("price", item["price"])))
+
+
+def _assignment_signature_value(portions: dict[str, Decimal]) -> tuple[tuple[str, str], ...]:
+    return tuple(
+        sorted(
+            (person, str(Decimal(str(portion)).quantize(Decimal("0.1"))))
+            for person, portion in portions.items()
+        )
+    )
+
+
+def _receipt_confirmation_value(
+    item: dict,
+    assignment: dict[str, Decimal],
+) -> tuple[tuple[str, str], tuple[tuple[str, str], ...]]:
+    return _receipt_item_signature(item), _assignment_signature_value(assignment)
+
+
+def _confirm_receipt_item(item: dict, assignment: dict[str, Decimal]) -> None:
+    st.session_state.receipt_item_values[item["id"]] = {
+        "name": _receipt_item_name(item).strip(),
+        "price": _receipt_item_price(item),
+    }
+    st.session_state.current_assignments[item["id"]] = assignment
+    st.session_state.confirmed_receipt_items[item["id"]] = _receipt_confirmation_value(item, assignment)
+
+
+def _receipt_item_is_confirmed(item: dict) -> bool:
+    if not _receipt_item_is_valid(item):
+        return False
+    confirmed = st.session_state.confirmed_receipt_items.get(item["id"])
+    if not confirmed:
+        return False
+    item_signature, assignment_signature = confirmed
+    return item_signature == _receipt_item_signature(item) and bool(assignment_signature)
+
+
+def _confirmed_receipt_item_count(items: list[dict]) -> int:
+    return sum(1 for item in items if _receipt_item_is_confirmed(item))
+
+
+def _first_unconfirmed_item_index(items: list[dict]) -> int:
+    for index, item in enumerate(items):
+        if not _receipt_item_is_confirmed(item):
+            return index
+    return max(len(items) - 1, 0)
+
+
+def _remove_receipt_item(item_id: str, item_count: int) -> None:
+    st.session_state.removed_item_ids.add(item_id)
+    st.session_state.confirmed_receipt_items.pop(item_id, None)
+    st.session_state.receipt_item_values.pop(item_id, None)
+    st.session_state.pop(f"item-name-{item_id}", None)
+    st.session_state.pop(f"item-price-{item_id}", None)
+    st.session_state.current_assignments.pop(item_id, None)
+    st.session_state.receipt_item_index = max(0, min(st.session_state.receipt_item_index, item_count - 2))
+    st.session_state.receipt_review_complete = False
+
+
+def _prune_removed_item_state(item_ids: set[str]) -> None:
+    st.session_state.current_assignments = {
+        item_id: portions
+        for item_id, portions in st.session_state.current_assignments.items()
+        if item_id in item_ids
+    }
+    st.session_state.confirmed_receipt_items = {
+        item_id: confirmation
+        for item_id, confirmation in st.session_state.confirmed_receipt_items.items()
+        if item_id in item_ids
+    }
+    st.session_state.receipt_item_values = {
+        item_id: value
+        for item_id, value in st.session_state.receipt_item_values.items()
+        if item_id in item_ids
+    }
 
 
 def _bill_signature(receipt: dict) -> tuple:
@@ -441,11 +708,28 @@ def _load_saved_bill_for_edit(saved: dict) -> None:
     receipt = saved.get("receipt") or {}
     st.session_state.loaded_receipt = _restore_receipt_decimals(receipt)
     st.session_state.receipt_text = receipt.get("raw_text", "")
+    st.session_state.last_receipt_text = st.session_state.receipt_text
     st.session_state.current_people = saved.get("people", [])
     st.session_state.current_assignments = _restore_assignments(saved.get("assignments", {}))
     st.session_state.plan = _restore_plan_decimals(saved.get("plan"))
     st.session_state.editing_bill_id = saved.get("id")
+    st.session_state.receipt_item_index = 0
+    st.session_state.receipt_review_complete = True
+    st.session_state.manual_item_count = 0
+    st.session_state.removed_item_ids = set()
+    st.session_state.receipt_item_values = {
+        item["id"]: {"name": item["name"], "price": Decimal(str(item["price"]))}
+        for item in st.session_state.loaded_receipt.get("items", [])
+    }
+    st.session_state.confirmed_receipt_items = {
+        item["id"]: (
+            (item["name"], str(Decimal(str(item["price"])).quantize(Decimal("0.01")))),
+            _assignment_signature_value(st.session_state.current_assignments.get(item["id"], {})),
+        )
+        for item in st.session_state.loaded_receipt.get("items", [])
+    }
     _clear_bill_widget_state()
+    st.session_state.receipt_review_complete = True
 
 
 def _save_current_bill_button() -> None:
@@ -481,6 +765,7 @@ def _clear_bill_widget_state() -> None:
             or key.startswith("assign-mode-")
             or key.startswith("assign-people-")
             or key.startswith("portion-")
+            or key == "assignment_item_index"
             or key.startswith("receipt-person-")
         ):
             del st.session_state[key]
@@ -575,6 +860,7 @@ def _clear_member_dependent_state() -> None:
             or key.startswith("assign-mode-")
             or key.startswith("assign-people-")
             or key.startswith("portion-")
+            or key == "assignment_item_index"
             or key == "receipt-people"
             or key.startswith("receipt-person-")
         ):
@@ -583,35 +869,87 @@ def _clear_member_dependent_state() -> None:
 
 def _assignment_editor(receipt: dict, people: list[str]) -> dict[str, dict[str, Decimal]]:
     st.subheader("Agent Question: Who ate what?")
+
+    items = receipt["items"]
+    _sync_assignment_items(items)
     _quick_assignment_box(receipt, people)
 
-    assignments = {}
-    for index, item in enumerate(receipt["items"], 1):
-        saved_portions = st.session_state.current_assignments.get(item["id"], {})
-        saved_people = [person for person in saved_portions if person in people]
-        if saved_people and set(saved_people) == set(people):
-            default_mode_index = 1
-        elif saved_people:
-            default_mode_index = 2
-        else:
-            default_mode_index = 0
-        mode = st.radio(
-            f"{index}. {item['name']} - {money(item['price'])}",
-            options=["Not assigned", "All", "Choose people"],
-            horizontal=True,
-            index=default_mode_index,
-            key=f"assign-mode-{item['id']}",
-        )
+    current_index = min(st.session_state.assignment_item_index, len(items) - 1)
+    st.session_state.assignment_item_index = current_index
+    item = items[current_index]
 
-        if mode == "All":
-            selected_people = people[:]
-        elif mode == "Choose people":
-            selected_people = _people_checkbox_selector(item, people)
-        else:
-            selected_people = []
+    st.markdown(f"**Item {current_index + 1} of {len(items)}**")
+    st.write(f"{item['name']} - {money(item['price'])}")
 
-        assignments[item["id"]] = _portion_inputs(item, selected_people)
+    assignments = dict(st.session_state.current_assignments)
+    assignments[item["id"]] = _assignment_controls(item, people)
+    st.session_state.current_assignments = assignments
+
+    completed_count = sum(1 for bill_item in items if assignments.get(bill_item["id"]))
+    st.progress(completed_count / len(items), text=f"{completed_count} of {len(items)} items assigned")
+
+    _assignment_navigation(items, assignments)
     return assignments
+
+
+def _sync_assignment_items(items: list[dict]) -> None:
+    item_ids = {item["id"] for item in items}
+    st.session_state.current_assignments = {
+        item_id: portions
+        for item_id, portions in st.session_state.current_assignments.items()
+        if item_id in item_ids
+    }
+    if st.session_state.assignment_item_index >= len(items):
+        st.session_state.assignment_item_index = max(len(items) - 1, 0)
+
+
+def _assignment_controls(item: dict, people: list[str]) -> dict[str, Decimal]:
+    saved_portions = st.session_state.current_assignments.get(item["id"], {})
+    saved_people = [person for person in saved_portions if person in people]
+    if saved_people and set(saved_people) == set(people):
+        default_mode_index = 0
+    else:
+        default_mode_index = 1
+    mode = st.radio(
+        "Who had this item?",
+        options=["All", "Choose people"],
+        horizontal=True,
+        index=default_mode_index,
+        key=f"assign-mode-{item['id']}",
+    )
+
+    if mode == "All":
+        selected_people = people[:]
+    else:
+        selected_people = _people_checkbox_selector(item, people)
+
+    return _portion_inputs(item, selected_people)
+
+
+def _assignment_navigation(items: list[dict], assignments: dict[str, dict[str, Decimal]]) -> None:
+    previous_col, next_col = st.columns(2)
+    current_index = st.session_state.assignment_item_index
+    current_item = items[current_index]
+    current_assigned = bool(assignments.get(current_item["id"]))
+
+    with previous_col:
+        if st.button("Previous item", use_container_width=True, disabled=current_index == 0):
+            st.session_state.assignment_item_index = max(current_index - 1, 0)
+            st.rerun()
+
+    with next_col:
+        is_last_item = current_index == len(items) - 1
+        next_label = "Finish assignments" if is_last_item else "Next item"
+        if st.button(next_label, type="primary", use_container_width=True, disabled=not current_assigned):
+            st.session_state.assignment_item_index = min(current_index + 1, len(items) - 1)
+            st.rerun()
+
+    if not current_assigned:
+        st.caption("Select one or more members to continue.")
+
+
+def _assignments_complete(receipt: dict, assignments: dict[str, dict[str, Decimal]]) -> bool:
+    return bool(receipt.get("items")) and all(assignments.get(item["id"]) for item in receipt["items"])
 
 
 def _people_checkbox_selector(item: dict, people: list[str]) -> list[str]:
@@ -691,10 +1029,18 @@ def _apply_quick_assignments(note: str, receipt: dict, people: list[str]) -> int
                 st.session_state[f"assign-mode-{item['id']}"] = "All"
                 for person in people:
                     st.session_state[f"assign-people-{item['id']}-{person}"] = False
+                st.session_state.current_assignments[item["id"]] = {
+                    person: Decimal("1")
+                    for person in people
+                }
             else:
                 st.session_state[f"assign-mode-{item['id']}"] = "Choose people"
                 for person in people:
                     st.session_state[f"assign-people-{item['id']}-{person}"] = person in eaters
+                st.session_state.current_assignments[item["id"]] = {
+                    person: Decimal("1")
+                    for person in eaters
+                }
             applied += 1
 
     return applied
