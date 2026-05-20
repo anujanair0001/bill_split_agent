@@ -10,7 +10,7 @@ import streamlit as st
 from src.agents import MockToolContext
 from src.tools import OcrError, calculate_bill_split, extract_receipt_text, parse_bill_text, remember_split_preferences
 from src.utils.formatting import money
-from src.utils.bill_store import get_saved_bill, list_saved_bills, save_bill_record
+from src.utils.bill_store import get_saved_bill, list_saved_bills, load_receipt_upload, save_bill_record, save_receipt_upload
 from src.utils.team_store import load_team_members, save_team_members
 
 
@@ -709,6 +709,7 @@ def _load_saved_bill_for_edit(saved: dict) -> None:
     st.session_state.loaded_receipt = _restore_receipt_decimals(receipt)
     st.session_state.receipt_text = receipt.get("raw_text", "")
     st.session_state.last_receipt_text = st.session_state.receipt_text
+    st.session_state.receipt_upload = load_receipt_upload(saved)
     st.session_state.current_people = saved.get("people", [])
     st.session_state.current_assignments = _restore_assignments(saved.get("assignments", {}))
     st.session_state.plan = _restore_plan_decimals(saved.get("plan"))
@@ -742,16 +743,18 @@ def _save_current_bill_button() -> None:
         st.warning("No bill details available to save.")
         return
 
-    saved = save_bill_record(
-        {
-            "id": st.session_state.editing_bill_id,
-            "restaurant_name": receipt.get("restaurant_name") or "Unknown restaurant",
-            "receipt": receipt,
-            "people": st.session_state.current_people,
-            "assignments": st.session_state.current_assignments,
-            "plan": st.session_state.plan,
-        }
-    )
+    record = {
+        "id": st.session_state.editing_bill_id,
+        "restaurant_name": receipt.get("restaurant_name") or "Unknown restaurant",
+        "receipt": receipt,
+        "people": st.session_state.current_people,
+        "assignments": st.session_state.current_assignments,
+        "plan": st.session_state.plan,
+    }
+    saved = save_bill_record(record)
+    upload_fields = save_receipt_upload(saved["id"], st.session_state.get("receipt_upload"))
+    if upload_fields:
+        saved = save_bill_record({**saved, **upload_fields})
     st.session_state.editing_bill_id = saved["id"]
     st.session_state.selected_saved_bill_id = saved["id"]
     st.success("Bill saved.")

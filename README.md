@@ -25,6 +25,42 @@ streamlit run app.py
 
 The UI lets you upload a receipt image/PDF, review OCR text, edit detected items, add people, assign dishes, and calculate the split.
 
+## Streamlit + Supabase Persistence
+
+For team use on Streamlit Community Cloud, configure Supabase so saved bills and receipt uploads survive app restarts.
+
+Create this table in Supabase SQL editor:
+
+```sql
+create table if not exists saved_bills (
+  id text primary key,
+  restaurant_name text,
+  payload jsonb not null,
+  receipt_file_path text,
+  receipt_file_name text,
+  receipt_file_type text,
+  created_at timestamptz,
+  updated_at timestamptz
+);
+```
+
+Create a private Storage bucket named:
+
+```text
+receipts
+```
+
+Add these Streamlit secrets:
+
+```toml
+SUPABASE_URL = "https://your-project.supabase.co"
+SUPABASE_SERVICE_KEY = "your-service-role-key"
+SUPABASE_BILLS_TABLE = "saved_bills"
+SUPABASE_RECEIPTS_BUCKET = "receipts"
+```
+
+If these secrets are missing, the app falls back to local `data/saved_bills.json`.
+
 You can also use the command-line flow:
 
 ```powershell

@@ -7,17 +7,23 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from . import supabase_store
+
 
 DATA_DIR = Path(__file__).resolve().parents[2] / "data"
 BILLS_FILE = DATA_DIR / "saved_bills.json"
 
 
 def list_saved_bills() -> list[dict[str, Any]]:
+    if supabase_store.is_configured():
+        return supabase_store.list_saved_bills()
     bills = _read_bills()
     return sorted(bills, key=lambda bill: bill.get("updated_at", ""), reverse=True)
 
 
 def get_saved_bill(bill_id: str) -> dict[str, Any] | None:
+    if supabase_store.is_configured():
+        return supabase_store.get_saved_bill(bill_id)
     for bill in _read_bills():
         if bill.get("id") == bill_id:
             return bill
@@ -25,6 +31,9 @@ def get_saved_bill(bill_id: str) -> dict[str, Any] | None:
 
 
 def save_bill_record(record: dict[str, Any]) -> dict[str, Any]:
+    if supabase_store.is_configured():
+        bill_id = record.get("id") or uuid4().hex
+        return supabase_store.save_bill_record({**record, "id": bill_id})
     bills = _read_bills()
     now = datetime.now().isoformat(timespec="seconds")
     bill_id = record.get("id") or uuid4().hex
@@ -47,6 +56,26 @@ def save_bill_record(record: dict[str, Any]) -> dict[str, Any]:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     BILLS_FILE.write_text(json.dumps(_to_jsonable(bills), indent=2), encoding="utf-8")
     return saved
+
+
+def save_receipt_upload(bill_id: str, upload: dict[str, Any] | None) -> dict[str, str]:
+    if not upload or not supabase_store.is_configured():
+        return {}
+    return supabase_store.upload_receipt_file(bill_id, upload)
+
+
+def load_receipt_upload(saved: dict[str, Any]) -> dict[str, Any] | None:
+    path = saved.get("receipt_file_path")
+    if not path or not supabase_store.is_configured():
+        return None
+    file_bytes = supabase_store.download_receipt_file(path)
+    if file_bytes is None:
+        return None
+    return {
+        "name": saved.get("receipt_file_name") or "receipt",
+        "type": saved.get("receipt_file_type") or "application/octet-stream",
+        "bytes": file_bytes,
+    }
 
 
 def _read_bills() -> list[dict[str, Any]]:
