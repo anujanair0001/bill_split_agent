@@ -13,6 +13,8 @@ import requests
 
 DEFAULT_TABLE = "saved_bills"
 DEFAULT_BUCKET = "receipts"
+DEFAULT_SETTINGS_TABLE = "app_settings"
+TEAM_MEMBERS_KEY = "team_members"
 
 
 def is_configured() -> bool:
@@ -110,6 +112,35 @@ def download_receipt_file(path: str) -> bytes | None:
     return response.content
 
 
+def load_team_members() -> list[str] | None:
+    response = requests.get(
+        _settings_url(),
+        headers=_headers(),
+        params={"key": f"eq.{TEAM_MEMBERS_KEY}", "select": "value", "limit": "1"},
+        timeout=20,
+    )
+    response.raise_for_status()
+    rows = response.json()
+    if not rows:
+        return None
+    value = rows[0].get("value")
+    return value if isinstance(value, list) else None
+
+
+def save_team_members(members: list[str]) -> list[str]:
+    response = requests.post(
+        _settings_url(),
+        headers={**_headers(), "Prefer": "resolution=merge-duplicates,return=representation"},
+        params={"on_conflict": "key"},
+        json={"key": TEAM_MEMBERS_KEY, "value": members},
+        timeout=20,
+    )
+    response.raise_for_status()
+    rows = response.json()
+    value = rows[0].get("value") if rows else members
+    return value if isinstance(value, list) else members
+
+
 def _row_to_record(row: dict[str, Any]) -> dict[str, Any]:
     payload = row.get("payload") or {}
     return {
@@ -129,6 +160,7 @@ def _config() -> dict[str, str]:
         "url": _setting("SUPABASE_URL"),
         "key": _setting("SUPABASE_SERVICE_KEY") or _setting("SUPABASE_KEY"),
         "table": _setting("SUPABASE_BILLS_TABLE") or DEFAULT_TABLE,
+        "settings_table": _setting("SUPABASE_SETTINGS_TABLE") or DEFAULT_SETTINGS_TABLE,
         "bucket": _setting("SUPABASE_RECEIPTS_BUCKET") or DEFAULT_BUCKET,
     }
 
@@ -162,6 +194,11 @@ def _rest_url() -> str:
 def _storage_object_url() -> str:
     config = _config()
     return f"{config['url'].rstrip('/')}/storage/v1/object/{config['bucket']}"
+
+
+def _settings_url() -> str:
+    config = _config()
+    return f"{config['url'].rstrip('/')}/rest/v1/{config['settings_table']}"
 
 
 def _quote_path(path: str) -> str:

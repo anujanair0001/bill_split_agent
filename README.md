@@ -42,6 +42,11 @@ create table if not exists saved_bills (
   created_at timestamptz,
   updated_at timestamptz
 );
+
+create table if not exists app_settings (
+  key text primary key,
+  value jsonb not null
+);
 ```
 
 Create a private Storage bucket named:
@@ -56,10 +61,11 @@ Add these Streamlit secrets:
 SUPABASE_URL = "https://your-project.supabase.co"
 SUPABASE_SERVICE_KEY = "your-service-role-key"
 SUPABASE_BILLS_TABLE = "saved_bills"
+SUPABASE_SETTINGS_TABLE = "app_settings"
 SUPABASE_RECEIPTS_BUCKET = "receipts"
 ```
 
-If these secrets are missing, the app falls back to local `data/saved_bills.json`.
+If these secrets are missing, the app falls back to local `data/saved_bills.json` and `data/team_members.json`.
 
 You can also use the command-line flow:
 
