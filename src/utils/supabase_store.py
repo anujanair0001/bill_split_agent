@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
+import functools
 import os
 from typing import Any
 from urllib.parse import quote
@@ -17,11 +18,48 @@ DEFAULT_SETTINGS_TABLE = "app_settings"
 TEAM_MEMBERS_KEY = "team_members"
 
 
+class SupabaseError(Exception):
+    """Raised when a Supabase API request fails."""
+    pass
+
+
+def set_db_error(error: Exception) -> None:
+    try:
+        import streamlit as st
+        st.session_state["supabase_error"] = str(error)
+    except Exception:
+        pass
+
+
+def clear_db_error() -> None:
+    try:
+        import streamlit as st
+        if "supabase_error" in st.session_state:
+            del st.session_state["supabase_error"]
+    except Exception:
+        pass
+
+
+def handle_request_errors(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            result = func(*args, **kwargs)
+            clear_db_error()
+            return result
+        except requests.RequestException as e:
+            err = SupabaseError(f"Supabase request failed: {e}")
+            set_db_error(err)
+            raise err from e
+    return wrapper
+
+
 def is_configured() -> bool:
     config = _config()
     return bool(config["url"] and config["key"])
 
 
+@handle_request_errors
 def list_saved_bills() -> list[dict[str, Any]]:
     response = requests.get(
         _rest_url(),
@@ -33,6 +71,7 @@ def list_saved_bills() -> list[dict[str, Any]]:
     return [_row_to_record(row) for row in response.json()]
 
 
+@handle_request_errors
 def get_saved_bill(bill_id: str) -> dict[str, Any] | None:
     response = requests.get(
         _rest_url(),
@@ -45,6 +84,7 @@ def get_saved_bill(bill_id: str) -> dict[str, Any] | None:
     return _row_to_record(rows[0]) if rows else None
 
 
+@handle_request_errors
 def save_bill_record(record: dict[str, Any]) -> dict[str, Any]:
     now = datetime.now().isoformat(timespec="seconds")
     saved = {
@@ -74,6 +114,7 @@ def save_bill_record(record: dict[str, Any]) -> dict[str, Any]:
     return _row_to_record(rows[0]) if rows else saved
 
 
+@handle_request_errors
 def upload_receipt_file(bill_id: str, upload: dict[str, Any]) -> dict[str, str]:
     file_name = upload.get("name") or "receipt"
     file_type = upload.get("type") or "application/octet-stream"
@@ -100,6 +141,7 @@ def upload_receipt_file(bill_id: str, upload: dict[str, Any]) -> dict[str, str]:
     }
 
 
+@handle_request_errors
 def download_receipt_file(path: str) -> bytes | None:
     response = requests.get(
         f"{_storage_object_url()}/{_quote_path(path)}",
@@ -112,6 +154,7 @@ def download_receipt_file(path: str) -> bytes | None:
     return response.content
 
 
+@handle_request_errors
 def load_team_members() -> list[str] | None:
     response = requests.get(
         _settings_url(),
@@ -127,6 +170,7 @@ def load_team_members() -> list[str] | None:
     return value if isinstance(value, list) else None
 
 
+@handle_request_errors
 def save_team_members(members: list[str]) -> list[str]:
     response = requests.post(
         _settings_url(),

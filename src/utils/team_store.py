@@ -13,9 +13,12 @@ DEFAULT_TEAM = ["Person 1", "Person 2"]
 
 def load_team_members() -> list[str]:
     if supabase_store.is_configured():
-        members = supabase_store.load_team_members()
-        if members:
-            return _clean_names(members) or DEFAULT_TEAM[:]
+        try:
+            members = supabase_store.load_team_members()
+            if members:
+                return _clean_names(members) or DEFAULT_TEAM[:]
+        except supabase_store.SupabaseError:
+            pass
     if not TEAM_FILE.exists():
         return DEFAULT_TEAM[:]
 
@@ -34,7 +37,10 @@ def load_team_members() -> list[str]:
 def save_team_members(members: list[str]) -> list[str]:
     cleaned = _clean_names(members)
     if supabase_store.is_configured():
-        return _clean_names(supabase_store.save_team_members(cleaned)) or DEFAULT_TEAM[:]
+        try:
+            return _clean_names(supabase_store.save_team_members(cleaned)) or DEFAULT_TEAM[:]
+        except supabase_store.SupabaseError:
+            pass
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     TEAM_FILE.write_text(json.dumps(cleaned, indent=2), encoding="utf-8")
     return cleaned

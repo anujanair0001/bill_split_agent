@@ -21,6 +21,9 @@ def main() -> None:
     _init_state()
     _apply_styles()
 
+    if st.session_state.get("supabase_error"):
+        st.warning("⚠️ Cloud database connection failed. Running in offline fallback mode (local storage).")
+
     header_left, header_right = st.columns([3, 1])
     with header_left:
         st.title("BillSplit Agent")

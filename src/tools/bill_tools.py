@@ -551,18 +551,7 @@ def _split_proportionally(
         return {person: Decimal("0.00") for person in item_totals}
     if subtotal == 0:
         return dict(zip(item_totals, _split_amount(charge, len(item_totals))))
-
-    raw_parts = {person: charge * item_total / subtotal for person, item_total in item_totals.items()}
-    rounded = {person: value.quantize(CENT, rounding=ROUND_HALF_UP) for person, value in raw_parts.items()}
-    drift = charge - sum(rounded.values(), Decimal("0"))
-    people_by_share = sorted(item_totals, key=item_totals.get, reverse=True)
-    index = 0
-    while drift != 0 and people_by_share:
-        step = CENT if drift > 0 else -CENT
-        rounded[people_by_share[index]] += step
-        drift -= step
-        index = (index + 1) % len(people_by_share)
-    return rounded
+    return _split_by_portions(charge, item_totals)
 
 
 def _recommendations(bill: dict[str, Any], assignments: dict[str, list[str]]) -> list[str]:
